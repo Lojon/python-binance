@@ -44,9 +44,9 @@ class ReconnectingWebsocket:
         self._is_binary = is_binary
         self._conn = None
         self._socket = None
-        self.ws = None
+        self.ws: Optional[ws.WebSocketClientProtocol] = None
         self.ws_state = WSListenerState.INITIALISING
-        self.reconnect_handle = None
+        self._queue = asyncio.Queue(loop=self._loop)
 
     async def __aenter__(self):
         await self.connect()
@@ -75,6 +75,7 @@ class ReconnectingWebsocket:
         self.ws_state = WSListenerState.STREAMING
         self._reconnects = 0
         await self._after_connect()
+        self._loop.call_soon(asyncio.create_task, self._read_loop())
 
     async def _before_connect(self):
         pass
@@ -94,52 +95,64 @@ class ReconnectingWebsocket:
             self._log.debug(f'error parsing evt json:{evt}')
             return None
 
-    async def recv(self):
-        res = None
-        while not res:
+    async def _read_loop(self):
+        while True:
+            res = None
             if not self.ws or self.ws_state != WSListenerState.STREAMING:
                 await self._wait_for_reconnect()
                 break
             if self.ws_state == WSListenerState.EXITING:
                 break
+            if self.ws.state == ws.protocol.State.CLOSING:
+                break
+            if self.ws.state == ws.protocol.State.CLOSED:
+                try:
+                    await self._reconnect()
+                except BinanceWebsocketUnableToConnect:
+                    return {
+                        'e': 'error',
+                        'm': 'Max reconnect retries reached'
+                    }
+                else:
+                    break
             try:
                 res = await asyncio.wait_for(self.ws.recv(), timeout=self.TIMEOUT)
             except asyncio.TimeoutError:
                 logging.debug(f"no message in {self.TIMEOUT} seconds")
             except asyncio.CancelledError as e:
                 logging.debug(f"cancelled error {e}")
-                raise
+                break
             except asyncio.IncompleteReadError as e:
                 logging.debug(f"incomplete read error {e}")
             except Exception as e:
                 logging.debug(f"exception {e}")
+                break
             else:
-                if self.ws_state == WSListenerState.EXITING:
+                if self.ws_state in (WSListenerState.EXITING, WSListenerState.RECONNECTING):
                     break
-                res = await self._try_handle_msg(res)
-                if self.ws_state == WSListenerState.EXITING:
+                res = self._handle_message(res)
+                if self.ws_state in (WSListenerState.EXITING, WSListenerState.RECONNECTING):
                     break
+
+            if res and self._queue.qsize() < 100:
+                await self._queue.put(res)
+
+    async def recv(self):
+        res = None
+        while not res:
+            try:
+                res = await asyncio.wait_for(self._queue.get(), timeout=self.TIMEOUT)
+            except asyncio.TimeoutError:
+                logging.debug(f"no message in {self.TIMEOUT} seconds")
         return res
 
     async def _wait_for_reconnect(self):
         while self.ws_state == WSListenerState.RECONNECTING:
             logging.debug("reconnecting waiting for connect")
-            await asyncio.sleep(0.01)
         if not self.ws:
             logging.debug("ignore message no ws")
         else:
             logging.debug(f"ignore message {self.ws_state}")
-
-    async def _try_handle_msg(self, res):
-        msg_res = self._handle_message(res)
-        if msg_res:
-            # cancel error timeout
-            if self.reconnect_handle:
-                self.reconnect_handle.cancel()
-            self.reconnect_handle = self._loop.call_later(
-                self.NO_MESSAGE_RECONNECT_TIMEOUT, self._no_message_received_reconnect
-            )
-        return msg_res
 
     def _get_reconnect_wait(self, attempts: int) -> int:
         expo = 2 ** attempts
@@ -159,8 +172,6 @@ class ReconnectingWebsocket:
         if self.ws_state == WSListenerState.RECONNECTING:
             return
         self.ws_state = WSListenerState.RECONNECTING
-        if self.reconnect_handle:
-            self.reconnect_handle.cancel()
         await self.before_reconnect()
         if self._reconnects < self.MAX_RECONNECTS:
             reconnect_wait = self._get_reconnect_wait(self._reconnects)
@@ -200,12 +211,11 @@ class KeepAliveWebsocket(ReconnectingWebsocket):
         self._start_socket_timer()
 
     def _start_socket_timer(self):
-        self._loop.create_task(self._keepalive_socket())
-        # self._timer = self._loop.call_later(
-        #     self._user_timeout,
-        #     asyncio.create_task,
-        #     self._keepalive_socket()
-        # )
+        self._timer = self._loop.call_later(
+            self._user_timeout,
+            asyncio.create_task,
+            self._keepalive_socket()
+        )
 
     async def _get_listen_key(self):
         if self._keepalive_type == 'user':
@@ -222,35 +232,29 @@ class KeepAliveWebsocket(ReconnectingWebsocket):
         return listen_key
 
     async def _keepalive_socket(self):
-        while True:
-            try:
-                await asyncio.sleep(self._user_timeout)
-                listen_key = await self._get_listen_key()
+        try:
+            listen_key = await self._get_listen_key()
 
-                if listen_key != self._path:
-                    logging.debug("listen key changed: reconnect")
-                    self._path = listen_key
-                    await self._reconnect()
-                    break
-                else:
-                    logging.debug("listen key same: keepalive")
-                    if self._keepalive_type == 'user':
-                        await self._client.stream_keepalive(self._path)
-                    elif self._keepalive_type == 'margin':  # cross-margin
-                        await self._client.margin_stream_keepalive(self._path)
-                    elif self._keepalive_type == 'futures':
-                        await self._client.futures_stream_keepalive(self._path)
-                    elif self._keepalive_type == 'coin_futures':
-                        await self._client.futures_coin_stream_keepalive(self._path)
-                    else:  # isolated margin
-                        # Passing symbol for isolated margin
-                        await self._client.isolated_margin_stream_keepalive(self._keepalive_type, self._path)
-                    # self._start_socket_timer()
-            except asyncio.CancelledError as e:
-                logging.debug(f"cancelled error {e}")
-                break
-            except Exception as e:
-                logging.debug(f"exception {e}")
+            if listen_key != self._path:
+                logging.debug("listen key changed: reconnect")
+                self._path = listen_key
+                await self._reconnect()
+            else:
+                logging.debug("listen key same: keepalive")
+                if self._keepalive_type == 'user':
+                    await self._client.stream_keepalive(self._path)
+                elif self._keepalive_type == 'margin':  # cross-margin
+                    await self._client.margin_stream_keepalive(self._path)
+                elif self._keepalive_type == 'futures':
+                    await self._client.futures_stream_keepalive(self._path)
+                elif self._keepalive_type == 'coin_futures':
+                    await self._client.futures_coin_stream_keepalive(self._path)
+                else:  # isolated margin
+                    # Passing symbol for isolated margin
+                    await self._client.isolated_margin_stream_keepalive(self._keepalive_type, self._path)
+                self._start_socket_timer()
+        except asyncio.CancelledError as e:
+            logging.debug(f"cancelled error {e}")
 
 
 class BinanceSocketManager:
@@ -585,6 +589,35 @@ class BinanceSocketManager:
 
         """
         return self._get_futures_socket(symbol.lower() + '@aggTrade', futures_type=futures_type)
+
+    def symbol_miniticker_socket(self, symbol: str):
+        """Start a websocket for a symbol's miniTicker data
+
+                https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-streams.md#individual-symbol-mini-ticker-stream
+
+                :param symbol: required
+                :type symbol: str
+
+                :returns: connection key string if successful, False otherwise
+
+                Message Format
+
+                .. code-block:: python
+
+                    {
+                        "e": "24hrMiniTicker",  // Event type
+                        "E": 123456789,         // Event time
+                        "s": "BNBBTC",          // Symbol
+                        "c": "0.0025",          // Close price
+                        "o": "0.0010",          // Open price
+                        "h": "0.0025",          // High price
+                        "l": "0.0010",          // Low price
+                        "v": "10000",           // Total traded base asset volume
+                        "q": "18"               // Total traded quote asset volume
+                    }
+
+                """
+        return self._get_socket(symbol.lower() + '@miniTicker')
 
     def symbol_ticker_socket(self, symbol: str):
         """Start a websocket for a symbol's ticker data
@@ -1102,10 +1135,19 @@ class ThreadedWebsocketManager(ThreadedApiManager):
     ) -> str:
         return self._start_async_socket(
             callback=callback,
-            socket_name='aggtrade_socket',
+            socket_name='aggtrade_futures_socket',
             params={
                 'symbol': symbol,
                 'futures_type': futures_type,
+            }
+        )
+
+    def start_symbol_miniticker_socket(self, callback: Callable, symbol: str) -> str:
+        return self._start_async_socket(
+            callback=callback,
+            socket_name='symbol_miniticker_socket',
+            params={
+                'symbol': symbol,
             }
         )
 
