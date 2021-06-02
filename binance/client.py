@@ -191,6 +191,7 @@ class BaseClient:
         else:
             version = 1
         return url + '/' + options[version] + '/' + path
+        # return url + '/' + self.FUTURES_API_VERSION + '/' + path
 
     def _create_futures_data_api_uri(self, path: str) -> str:
         url = self.FUTURES_DATA_URL
@@ -259,16 +260,16 @@ class BaseClient:
         if data and isinstance(data, dict):
             kwargs['data'] = data
 
-        if signed:
-            # generate signature
-            kwargs['data']['timestamp'] = int(time.time() * 1000 + self.timestamp_offset)
-            kwargs['data']['signature'] = self._generate_signature(kwargs['data'])
-
             # find any requests params passed and apply them
             if 'requests_params' in kwargs['data']:
                 # merge requests params into kwargs
                 kwargs.update(kwargs['data']['requests_params'])
                 del (kwargs['data']['requests_params'])
+
+        if signed:
+            # generate signature
+            kwargs['data']['timestamp'] = int(time.time() * 1000 + self.timestamp_offset)
+            kwargs['data']['signature'] = self._generate_signature(kwargs['data'])
 
         # sort get and post params to match signature order
         if data:
@@ -304,7 +305,7 @@ class Client(BaseClient):
         session.headers.update(headers)
         return session
 
-    def _request(self, method, uri: str, signed: bool, force_params: bool = False, **kwargs) -> Dict:
+    def _request(self, method, uri: str, signed: bool, force_params: bool = False, **kwargs):
 
         kwargs = self._get_request_kwargs(method, signed, force_params, **kwargs)
 
@@ -312,7 +313,7 @@ class Client(BaseClient):
         return self._handle_response(self.response)
 
     @staticmethod
-    def _handle_response(response: requests.Response) -> Dict:
+    def _handle_response(response: requests.Response):
         """Internal helper for handling API responses from the Binance server.
         Raises the appropriate exceptions when necessary; otherwise, returns the
         response.
@@ -326,7 +327,7 @@ class Client(BaseClient):
 
     def _request_api(
             self, method, path: str, signed: bool = False, version=BaseClient.PUBLIC_API_VERSION, **kwargs
-    ) -> Dict:
+    ):
         uri = self._create_api_uri(path, signed, version)
         return self._request(method, uri, signed, **kwargs)
 
@@ -364,7 +365,7 @@ class Client(BaseClient):
         uri = self._create_website_uri(path)
         return self._request(method, uri, signed, **kwargs)
 
-    def _get(self, path, signed=False, version=BaseClient.PUBLIC_API_VERSION, **kwargs) -> Dict:
+    def _get(self, path, signed=False, version=BaseClient.PUBLIC_API_VERSION, **kwargs):
         return self._request_api('get', path, signed, version, **kwargs)
 
     def _post(self, path, signed=False, version=BaseClient.PUBLIC_API_VERSION, **kwargs) -> Dict:
@@ -542,13 +543,10 @@ class Client(BaseClient):
 
     # Market Data Endpoints
 
-    def get_all_tickers(self, symbol: Optional[str] = None) -> Dict:
-        """Latest price for a symbol or symbols.
+    def get_all_tickers(self) -> List[Dict[str, str]]:
+        """Latest price for all symbols.
 
         https://binance-docs.github.io/apidocs/spot/en/#symbol-price-ticker
-
-        :param symbol: optional
-        :type symbol: str
 
         :returns: List of market tickers
 
@@ -568,10 +566,7 @@ class Client(BaseClient):
         :raises: BinanceRequestException, BinanceAPIException
 
         """
-        params = {}
-        if symbol:
-            params['symbol'] = symbol
-        return self._get('ticker/price', version=self.PRIVATE_API_VERSION, data=params)
+        return self._get('ticker/price', version=self.PRIVATE_API_VERSION)
 
     def get_orderbook_tickers(self) -> Dict:
         """Best price/qty on the order book for all symbols.
@@ -2643,7 +2638,7 @@ class Client(BaseClient):
         """
         result = self.get_withdraw_history(**params)
 
-        for entry in result['withdrawList']:
+        for entry in result:
             if 'id' in entry and entry['id'] == withdraw_id:
                 return entry
 
@@ -5243,15 +5238,23 @@ class Client(BaseClient):
         https://binance-docs.github.io/apidocs/futures/en/#get-all-liquidation-orders-market_data
 
         """
-        return self._request_futures_api('get', 'ticker/allForceOrders', data=params)
+        return self._request_futures_api('get', 'forceOrders', signed=True, data=params)
+
+    def futures_adl_quantile_estimate(self, **params):
+        """Get Position ADL Quantile Estimate
+
+        https://binance-docs.github.io/apidocs/futures/en/#position-adl-quantile-estimation-user_data
+
+        """
+        return self._request_futures_api('get', 'adlQuantile', signed=True, data=params)
 
     def futures_open_interest(self, **params):
         """Get present open interest of a specific symbol.
 
-        https://binance-docs.github.io/apidocs/futures/en/#open-interest-market_data
+        https://binance-docs.github.io/apidocs/futures/en/#open-interest
 
         """
-        return self._request_futures_api('get', 'ticker/openInterest', data=params)
+        return self._request_futures_api('get', 'openInterest', data=params)
 
     def futures_open_interest_hist(self, **params):
         """Get open interest statistics of a specific symbol.
@@ -5611,10 +5614,10 @@ class Client(BaseClient):
     def futures_coin_liquidation_orders(self, **params):
         """Get all liquidation orders
 
-        https://binance-docs.github.io/apidocs/delivery/en/#get-all-liquidation-orders
+        https://binance-docs.github.io/apidocs/delivery/en/#user-39-s-force-orders-user_data
 
         """
-        return self._request_futures_coin_api("get", "allForceOrders", data=params)
+        return self._request_futures_coin_api("get", "forceOrders", signed=True, data=params)
 
     def futures_coin_open_interest(self, **params):
         """Get present open interest of a specific symbol.
@@ -6469,7 +6472,7 @@ class AsyncClient(BaseClient):
             assert self.session
             await self.session.close()
 
-    async def _request(self, method, uri: str, signed: bool, force_params: bool = False, **kwargs) -> Dict:
+    async def _request(self, method, uri: str, signed: bool, force_params: bool = False, **kwargs):
 
         kwargs = self._get_request_kwargs(method, signed, force_params, **kwargs)
 
@@ -6477,7 +6480,7 @@ class AsyncClient(BaseClient):
             self.response = response
             return await self._handle_response(response)
 
-    async def _handle_response(self, response: aiohttp.ClientResponse) -> Dict:
+    async def _handle_response(self, response: aiohttp.ClientResponse):
         """Internal helper for handling API responses from the Binance server.
         Raises the appropriate exceptions when necessary; otherwise, returns the
         response.
@@ -6490,7 +6493,7 @@ class AsyncClient(BaseClient):
             txt = await response.text()
             raise BinanceRequestException(f'Invalid Response: {txt}')
 
-    async def _request_api(self, method, path, signed=False, version=BaseClient.PUBLIC_API_VERSION, **kwargs) -> Dict:
+    async def _request_api(self, method, path, signed=False, version=BaseClient.PUBLIC_API_VERSION, **kwargs):
         uri = self._create_api_uri(path, signed, version)
         return await self._request(method, uri, signed, **kwargs)
 
@@ -6528,7 +6531,7 @@ class AsyncClient(BaseClient):
         uri = self._create_website_uri(path)
         return await self._request(method, uri, signed, **kwargs)
 
-    async def _get(self, path, signed=False, version=BaseClient.PUBLIC_API_VERSION, **kwargs) -> Dict:
+    async def _get(self, path, signed=False, version=BaseClient.PUBLIC_API_VERSION, **kwargs):
         return await self._request_api('get', path, signed, version, **kwargs)
 
     async def _post(self, path, signed=False, version=BaseClient.PUBLIC_API_VERSION, **kwargs) -> Dict:
@@ -6578,7 +6581,7 @@ class AsyncClient(BaseClient):
 
     # Market Data Endpoints
 
-    async def get_all_tickers(self, symbol: Optional[str] = None) -> Dict:
+    async def get_all_tickers(self, symbol: Optional[str] = None) -> List[Dict[str, str]]:
         params = {}
         if symbol:
             params['symbol'] = symbol
@@ -7041,7 +7044,7 @@ class AsyncClient(BaseClient):
     async def get_withdraw_history_id(self, withdraw_id, **params):
         result = await self.get_withdraw_history(**params)
 
-        for entry in result['withdrawList']:
+        for entry in result:
             if 'id' in entry and entry['id'] == withdraw_id:
                 return entry
 
@@ -7369,10 +7372,13 @@ class AsyncClient(BaseClient):
         return await self._request_futures_api('get', 'ticker/bookTicker', data=params)
 
     async def futures_liquidation_orders(self, **params):
-        return await self._request_futures_api('get', 'ticker/allForceOrders', data=params)
+        return await self._request_futures_api('get', 'forceOrders', signed=True, data=params)
+
+    async def futures_adl_quantile_estimate(self, **params):
+        return await self._request_futures_api('get', 'adlQuantile', signed=True, data=params)
 
     async def futures_open_interest(self, **params):
-        return await self._request_futures_api('get', 'ticker/openInterest', data=params)
+        return await self._request_futures_api('get', 'openInterest', data=params)
 
     async def futures_open_interest_hist(self, **params):
         return await self._request_futures_data_api('get', 'openInterestHist', data=params)
@@ -7394,9 +7400,6 @@ class AsyncClient(BaseClient):
         query_string = query_string.replace('%27', '%22')
         params['batchOrders'] = query_string[12:]
         return await self._request_futures_api('post', 'batchOrders', True, data=params)
-
-    async def futures_get_adl(self, **params):
-        return await self._request_futures_api('get', 'adlQuantile', True, data=params)
 
     async def futures_get_order(self, **params):
         return await self._request_futures_api('get', 'order', True, data=params)
@@ -7525,7 +7528,7 @@ class AsyncClient(BaseClient):
         return await self._request_futures_coin_api("get", "ticker/bookTicker", data=params)
 
     async def futures_coin_liquidation_orders(self, **params):
-        return await self._request_futures_coin_api("get", "allForceOrders", data=params)
+        return await self._request_futures_coin_api("get", "forceOrders", signed=True, data=params)
 
     async def futures_coin_open_interest(self, **params):
         return await self._request_futures_coin_api("get", "openInterest", data=params)
