@@ -25,7 +25,6 @@ class WSListenerState(Enum):
 
 
 class ReconnectingWebsocket:
-
     MAX_RECONNECTS = 5
     MAX_RECONNECT_SECONDS = 60
     MIN_RECONNECT_WAIT = 0.1
@@ -33,7 +32,7 @@ class ReconnectingWebsocket:
     NO_MESSAGE_RECONNECT_TIMEOUT = 60
 
     def __init__(
-        self, loop, url: str, path: Optional[str] = None, prefix: str = 'ws/', is_binary: bool = False, exit_coro=None
+            self, loop, url: str, path: Optional[str] = None, prefix: str = 'ws/', is_binary: bool = False, exit_coro=None
     ):
         self._loop = loop or asyncio.get_event_loop()
         self._log = logging.getLogger(__name__)
@@ -45,9 +44,9 @@ class ReconnectingWebsocket:
         self._is_binary = is_binary
         self._conn = None
         self._socket = None
-        self.ws: Optional[ws.WebSocketClientProtocol] = None
+        self.ws = None
         self.ws_state = WSListenerState.INITIALISING
-        self._queue = asyncio.Queue(loop=self._loop)
+        self.reconnect_handle = None
 
     async def __aenter__(self):
         await self.connect()
@@ -76,7 +75,6 @@ class ReconnectingWebsocket:
         self.ws_state = WSListenerState.STREAMING
         self._reconnects = 0
         await self._after_connect()
-        self._loop.call_soon(asyncio.create_task, self._read_loop())
 
     async def _before_connect(self):
         pass
@@ -96,64 +94,52 @@ class ReconnectingWebsocket:
             self._log.debug(f'error parsing evt json:{evt}')
             return None
 
-    async def _read_loop(self):
-        while True:
-            res = None
+    async def recv(self):
+        res = None
+        while not res:
             if not self.ws or self.ws_state != WSListenerState.STREAMING:
                 await self._wait_for_reconnect()
                 break
             if self.ws_state == WSListenerState.EXITING:
                 break
-            if self.ws.state == ws.protocol.State.CLOSING:
-                break
-            if self.ws.state == ws.protocol.State.CLOSED:
-                try:
-                    await self._reconnect()
-                except BinanceWebsocketUnableToConnect:
-                    return {
-                        'e': 'error',
-                        'm': 'Max reconnect retries reached'
-                    }
-                else:
-                    break
             try:
                 res = await asyncio.wait_for(self.ws.recv(), timeout=self.TIMEOUT)
             except asyncio.TimeoutError:
                 logging.debug(f"no message in {self.TIMEOUT} seconds")
             except asyncio.CancelledError as e:
                 logging.debug(f"cancelled error {e}")
-                break
+                raise
             except asyncio.IncompleteReadError as e:
                 logging.debug(f"incomplete read error {e}")
             except Exception as e:
                 logging.debug(f"exception {e}")
-                break
             else:
-                if self.ws_state in (WSListenerState.EXITING, WSListenerState.RECONNECTING):
+                if self.ws_state == WSListenerState.EXITING:
                     break
-                res = self._handle_message(res)
-                if self.ws_state in (WSListenerState.EXITING, WSListenerState.RECONNECTING):
+                res = await self._try_handle_msg(res)
+                if self.ws_state == WSListenerState.EXITING:
                     break
-
-            if res and self._queue.qsize() < 100:
-                await self._queue.put(res)
-
-    async def recv(self):
-        res = None
-        while not res:
-            try:
-                res = await asyncio.wait_for(self._queue.get(), timeout=self.TIMEOUT)
-            except asyncio.TimeoutError:
-                logging.debug(f"no message in {self.TIMEOUT} seconds")
         return res
 
     async def _wait_for_reconnect(self):
         while self.ws_state == WSListenerState.RECONNECTING:
             logging.debug("reconnecting waiting for connect")
+            await asyncio.sleep(0.01)
         if not self.ws:
             logging.debug("ignore message no ws")
         else:
             logging.debug(f"ignore message {self.ws_state}")
+
+    async def _try_handle_msg(self, res):
+        msg_res = self._handle_message(res)
+        if msg_res:
+            # cancel error timeout
+            if self.reconnect_handle:
+                self.reconnect_handle.cancel()
+            self.reconnect_handle = self._loop.call_later(
+                self.NO_MESSAGE_RECONNECT_TIMEOUT, self._no_message_received_reconnect
+            )
+        return msg_res
 
     def _get_reconnect_wait(self, attempts: int) -> int:
         expo = 2 ** attempts
@@ -173,6 +159,8 @@ class ReconnectingWebsocket:
         if self.ws_state == WSListenerState.RECONNECTING:
             return
         self.ws_state = WSListenerState.RECONNECTING
+        if self.reconnect_handle:
+            self.reconnect_handle.cancel()
         await self.before_reconnect()
         if self._reconnects < self.MAX_RECONNECTS:
             reconnect_wait = self._get_reconnect_wait(self._reconnects)
@@ -212,11 +200,12 @@ class KeepAliveWebsocket(ReconnectingWebsocket):
         self._start_socket_timer()
 
     def _start_socket_timer(self):
-        self._timer = self._loop.call_later(
-            self._user_timeout,
-            asyncio.create_task,
-            self._keepalive_socket()
-        )
+        self._loop.create_task(self._keepalive_socket())
+        # self._timer = self._loop.call_later(
+        #     self._user_timeout,
+        #     asyncio.create_task,
+        #     self._keepalive_socket()
+        # )
 
     async def _get_listen_key(self):
         if self._keepalive_type == 'user':
@@ -233,30 +222,38 @@ class KeepAliveWebsocket(ReconnectingWebsocket):
         return listen_key
 
     async def _keepalive_socket(self):
-        listen_key = await self._get_listen_key()
+        while True:
+            try:
+                await asyncio.sleep(self._user_timeout)
+                listen_key = await self._get_listen_key()
 
-        if listen_key != self._path:
-            logging.debug("listen key changed: reconnect")
-            self._path = listen_key
-            await self._reconnect()
-        else:
-            logging.debug("listen key same: keepalive")
-            if self._keepalive_type == 'user':
-                await self._client.stream_keepalive(self._path)
-            elif self._keepalive_type == 'margin':  # cross-margin
-                await self._client.margin_stream_keepalive(self._path)
-            elif self._keepalive_type == 'futures':
-                await self._client.futures_stream_keepalive(self._path)
-            elif self._keepalive_type == 'coin_futures':
-                await self._client.futures_coin_stream_keepalive(self._path)
-            else:  # isolated margin
-                # Passing symbol for isolated margin
-                await self._client.isolated_margin_stream_keepalive(self._keepalive_type, self._path)
-            self._start_socket_timer()
+                if listen_key != self._path:
+                    logging.debug("listen key changed: reconnect")
+                    self._path = listen_key
+                    await self._reconnect()
+                    break
+                else:
+                    logging.debug("listen key same: keepalive")
+                    if self._keepalive_type == 'user':
+                        await self._client.stream_keepalive(self._path)
+                    elif self._keepalive_type == 'margin':  # cross-margin
+                        await self._client.margin_stream_keepalive(self._path)
+                    elif self._keepalive_type == 'futures':
+                        await self._client.futures_stream_keepalive(self._path)
+                    elif self._keepalive_type == 'coin_futures':
+                        await self._client.futures_coin_stream_keepalive(self._path)
+                    else:  # isolated margin
+                        # Passing symbol for isolated margin
+                        await self._client.isolated_margin_stream_keepalive(self._keepalive_type, self._path)
+                    # self._start_socket_timer()
+            except asyncio.CancelledError as e:
+                logging.debug(f"cancelled error {e}")
+                break
+            except Exception as e:
+                logging.debug(f"exception {e}")
 
 
 class BinanceSocketManager:
-
     STREAM_URL = 'wss://stream.binance.{}:9443/'
     STREAM_TESTNET_URL = 'wss://testnet.binance.vision/'
     FSTREAM_URL = 'wss://fstream.binance.{}/'
@@ -312,7 +309,7 @@ class BinanceSocketManager:
         return self._conns[path]
 
     def _get_account_socket(
-        self, path: str, stream_url: Optional[str] = None, prefix: str = 'ws/', is_binary: bool = False
+            self, path: str, stream_url: Optional[str] = None, prefix: str = 'ws/', is_binary: bool = False
     ):
         if path not in self._conns:
             self._conns[path] = KeepAliveWebsocket(
@@ -588,35 +585,6 @@ class BinanceSocketManager:
 
         """
         return self._get_futures_socket(symbol.lower() + '@aggTrade', futures_type=futures_type)
-
-    def symbol_miniticker_socket(self, symbol: str):
-        """Start a websocket for a symbol's miniTicker data
-
-                https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-streams.md#individual-symbol-mini-ticker-stream
-
-                :param symbol: required
-                :type symbol: str
-
-                :returns: connection key string if successful, False otherwise
-
-                Message Format
-
-                .. code-block:: python
-
-                    {
-                        "e": "24hrMiniTicker",  // Event type
-                        "E": 123456789,         // Event time
-                        "s": "BNBBTC",          // Symbol
-                        "c": "0.0025",          // Close price
-                        "o": "0.0010",          // Open price
-                        "h": "0.0025",          // High price
-                        "l": "0.0010",          // Low price
-                        "v": "10000",           // Total traded base asset volume
-                        "q": "18"               // Total traded quote asset volume
-                    }
-
-                """
-        return self._get_socket(symbol.lower() + '@miniTicker')
 
     def symbol_ticker_socket(self, symbol: str):
         """Start a websocket for a symbol's ticker data
@@ -1051,15 +1019,15 @@ class BinanceSocketManager:
         if conn_key not in self._conns:
             return
 
-        del(self._conns[conn_key])
+        del (self._conns[conn_key])
 
 
 class ThreadedWebsocketManager(ThreadedApiManager):
 
     def __init__(
-        self, api_key: Optional[str] = None, api_secret: Optional[str] = None,
-        requests_params: Dict[str, str] = None, tld: str = 'com',
-        testnet: bool = False
+            self, api_key: Optional[str] = None, api_secret: Optional[str] = None,
+            requests_params: Dict[str, str] = None, tld: str = 'com',
+            testnet: bool = False
     ):
         super().__init__(api_key, api_secret, requests_params, tld, testnet)
         self._bsm: Optional[BinanceSocketManager] = None
@@ -1069,7 +1037,7 @@ class ThreadedWebsocketManager(ThreadedApiManager):
         self._bsm = BinanceSocketManager(self._client, self._loop)
 
     def _start_async_socket(
-        self, callback: Callable, socket_name: str, params: Dict[str, Any], path: Optional[str] = None
+            self, callback: Callable, socket_name: str, params: Dict[str, Any], path: Optional[str] = None
     ) -> str:
         while not self._bsm:
             time.sleep(0.1)
@@ -1080,7 +1048,7 @@ class ThreadedWebsocketManager(ThreadedApiManager):
         return path
 
     def start_depth_socket(
-        self, callback: Callable, symbol: str, depth: Optional[str] = None, interval: Optional[int] = None
+            self, callback: Callable, symbol: str, depth: Optional[str] = None, interval: Optional[int] = None
     ) -> str:
         return self._start_async_socket(
             callback=callback,
@@ -1130,23 +1098,14 @@ class ThreadedWebsocketManager(ThreadedApiManager):
         )
 
     def start_aggtrade_futures_socket(
-        self, callback: Callable, symbol: str, futures_type: FuturesType = FuturesType.USD_M
+            self, callback: Callable, symbol: str, futures_type: FuturesType = FuturesType.USD_M
     ) -> str:
         return self._start_async_socket(
             callback=callback,
-            socket_name='aggtrade_futures_socket',
+            socket_name='aggtrade_socket',
             params={
                 'symbol': symbol,
                 'futures_type': futures_type,
-            }
-        )
-
-    def start_symbol_miniticker_socket(self, callback: Callable, symbol: str) -> str:
-        return self._start_async_socket(
-            callback=callback,
-            socket_name='symbol_miniticker_socket',
-            params={
-                'symbol': symbol,
             }
         )
 
@@ -1177,7 +1136,7 @@ class ThreadedWebsocketManager(ThreadedApiManager):
         )
 
     def start_symbol_mark_price_socket(
-        self, callback: Callable, symbol: str, fast: bool = True, futures_type: FuturesType = FuturesType.USD_M
+            self, callback: Callable, symbol: str, fast: bool = True, futures_type: FuturesType = FuturesType.USD_M
     ) -> str:
         return self._start_async_socket(
             callback=callback,
@@ -1190,7 +1149,7 @@ class ThreadedWebsocketManager(ThreadedApiManager):
         )
 
     def start_all_mark_price_socket(
-        self, callback: Callable, fast: bool = True, futures_type: FuturesType = FuturesType.USD_M
+            self, callback: Callable, fast: bool = True, futures_type: FuturesType = FuturesType.USD_M
     ) -> str:
         return self._start_async_socket(
             callback=callback,
@@ -1202,7 +1161,7 @@ class ThreadedWebsocketManager(ThreadedApiManager):
         )
 
     def start_symbol_ticker_futures_socket(
-        self, callback: Callable, symbol: str, futures_type: FuturesType = FuturesType.USD_M
+            self, callback: Callable, symbol: str, futures_type: FuturesType = FuturesType.USD_M
     ) -> str:
         return self._start_async_socket(
             callback=callback,
@@ -1214,7 +1173,7 @@ class ThreadedWebsocketManager(ThreadedApiManager):
         )
 
     def start_individual_symbol_ticker_futures_socket(
-        self, callback: Callable, symbol: str, futures_type: FuturesType = FuturesType.USD_M
+            self, callback: Callable, symbol: str, futures_type: FuturesType = FuturesType.USD_M
     ) -> str:
         return self._start_async_socket(
             callback=callback,
@@ -1269,7 +1228,7 @@ class ThreadedWebsocketManager(ThreadedApiManager):
         )
 
     def start_futures_multiplex_socket(
-        self, callback: Callable, streams: List[str], futures_type: FuturesType = FuturesType.USD_M
+            self, callback: Callable, streams: List[str], futures_type: FuturesType = FuturesType.USD_M
     ) -> str:
         return self._start_async_socket(
             callback=callback,
@@ -1336,7 +1295,7 @@ class ThreadedWebsocketManager(ThreadedApiManager):
         )
 
     def start_options_kline_socket(
-        self, callback: Callable, symbol: str, interval=AsyncClient.KLINE_INTERVAL_1MINUTE
+            self, callback: Callable, symbol: str, interval=AsyncClient.KLINE_INTERVAL_1MINUTE
     ) -> str:
         return self._start_async_socket(
             callback=callback,
