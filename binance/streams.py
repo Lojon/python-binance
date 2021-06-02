@@ -232,29 +232,26 @@ class KeepAliveWebsocket(ReconnectingWebsocket):
         return listen_key
 
     async def _keepalive_socket(self):
-        try:
-            listen_key = await self._get_listen_key()
+        listen_key = await self._get_listen_key()
 
-            if listen_key != self._path:
-                logging.debug("listen key changed: reconnect")
-                self._path = listen_key
-                await self._reconnect()
-            else:
-                logging.debug("listen key same: keepalive")
-                if self._keepalive_type == 'user':
-                    await self._client.stream_keepalive(self._path)
-                elif self._keepalive_type == 'margin':  # cross-margin
-                    await self._client.margin_stream_keepalive(self._path)
-                elif self._keepalive_type == 'futures':
-                    await self._client.futures_stream_keepalive(self._path)
-                elif self._keepalive_type == 'coin_futures':
-                    await self._client.futures_coin_stream_keepalive(self._path)
-                else:  # isolated margin
-                    # Passing symbol for isolated margin
-                    await self._client.isolated_margin_stream_keepalive(self._keepalive_type, self._path)
-                self._start_socket_timer()
-        except asyncio.CancelledError as e:
-            logging.debug(f"cancelled error {e}")
+        if listen_key != self._path:
+            logging.debug("listen key changed: reconnect")
+            self._path = listen_key
+            await self._reconnect()
+        else:
+            logging.debug("listen key same: keepalive")
+            if self._keepalive_type == 'user':
+                await self._client.stream_keepalive(self._path)
+            elif self._keepalive_type == 'margin':  # cross-margin
+                await self._client.margin_stream_keepalive(self._path)
+            elif self._keepalive_type == 'futures':
+                await self._client.futures_stream_keepalive(self._path)
+            elif self._keepalive_type == 'coin_futures':
+                await self._client.futures_coin_stream_keepalive(self._path)
+            else:  # isolated margin
+                # Passing symbol for isolated margin
+                await self._client.isolated_margin_stream_keepalive(self._keepalive_type, self._path)
+            self._start_socket_timer()
 
 
 class BinanceSocketManager:
